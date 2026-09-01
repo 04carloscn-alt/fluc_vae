@@ -1,0 +1,23 @@
+# Datos crudos de UrQMD y resultados generados (pesan demasiado para git)
+output/
+*.f14
+*.f15
+*.h5
+*.npy
+*.csv
+plots/
+correlator_plots/
+vae_*_results/
+moments_plots/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.egg-info/
+
+# SO / editores
+.DS_Store
+.idea/
+.vscode/

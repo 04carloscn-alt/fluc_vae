@@ -1,0 +1,338 @@
+% ============================================================================
+%  APARTADO: Pipeline Computacional — de la Simulación UrQMD al VAE
+%  Sugerencia de ubicación: Capítulo 4 "Construcción del Análisis",
+%  como nuevas subsecciones dentro de la Sección "Estado Actual: Simulaciones
+%  MCG + UrQMD" (después de la línea que hoy termina en \label{eq:elbo} /
+%  antes de \chapter{Resultados}), o alternativamente como cuerpo del
+%  Capítulo 6 "Avances y Trabajo a Realizar" en sustitución de la lista
+%  genérica de "Etapa I/II/III", ya que lo que sigue describe el trabajo
+%  YA implementado, no solo lo planeado.
+% ============================================================================
+
+\subsection{Generación de los Eventos UrQMD}
+\label{sec:generacion_urqmd}
+
+\noindent
+La línea de base del análisis se construye a partir de $10^{5}$ eventos de
+colisiones Bi+Bi a $\sqrt{s_{NN}} = 11$ GeV generados con UrQMD en modo
+mínimamente sesgado (\textit{minimum bias}), es decir, sin restringir a priori
+el parámetro de impacto $b$, de modo que el muestreo cubre todo el espectro
+de centralidades. Esta energía se eligió porque corresponde a la región del
+diagrama de fases donde, de acuerdo con las predicciones discutidas en la
+Sección~\ref{sec:CEP}, se localiza el punto crítico (CEP), maximizando la
+densidad bariónica neta accesible en NICA.
+
+\noindent
+Cada uno de los $10^{5}$ eventos se generó con una semilla aleatoria
+(\textit{seed}) distinta. Esto es una condición necesaria, no solo una
+cuestión de reproducibilidad: puesto que el observable central del análisis
+es la \emph{fluctuación evento por evento} de $\langle p_T \rangle$
+(Ecuación~\ref{eq:momento_n_muestral}), una correlación espuria entre
+eventos generados con semillas repetidas o encadenadas subestimaría
+artificialmente la varianza $\sigma^2_{\langle p_T \rangle}$ y, con ella,
+cualquier señal dinámica atribuible al CEP. Por razones de capacidad de
+cómputo, la corrida completa se fraccionó en varios lotes
+(\texttt{Bi\_11GeV\_MB1}, \dots, \texttt{Bi\_11GeV\_MB5}), cada uno con su
+propio conjunto de subdirectorios \texttt{run\_NNNN/}; todos los scripts de
+análisis descritos más adelante aceptan múltiples carpetas como entrada y
+las combinan en una sola pasada de lectura, de forma que la fragmentación es
+transparente para el análisis. Los archivos de salida, en formato
+\texttt{.f14} (estándar de UrQMD), se alojaron en almacenamiento en la nube
+para permitir su descarga y procesamiento desde distintos equipos de
+cómputo.
+
+% ------------------------------------------------------------------
+\subsection{Lectura de los Archivos \texttt{.f14}: \texttt{read\_f14.py}}
+\label{sec:read_f14}
+
+\noindent
+Se desarrolló un lector propio, \texttt{read\_f14.py}, para el formato ASCII
+de salida de UrQMD 3.4 (19 columnas por partícula: posición y tiempo de
+\textit{freeze-out}, cuadrimomento $(E,p_x,p_y,p_z)$, masa, código de
+partícula \texttt{ityp}, isospín, carga \texttt{chg}, y, de manera crucial
+para este trabajo, el contador de colisiones \texttt{ncl}). A partir del
+cuadrimomento se derivan, partícula por partícula y directamente al nivel
+del generador (es decir, \emph{antes} de cualquier simulación del detector),
+las cuatro cantidades cinemáticas usadas en todo el análisis posterior:
+
+\begin{equation}
+    p_T=\sqrt{p_x^2+p_y^2},\quad
+    P=\sqrt{p_x^2+p_y^2+p_z^2},\quad
+    \eta=\tfrac{1}{2}\ln\!\frac{P+p_z}{P-p_z},\quad
+    \phi=\operatorname{atan2}(p_y,p_x).
+\end{equation}
+
+\noindent
+El parámetro de impacto $b$ de cada evento se extrae de la línea de
+cabecera (\texttt{"i"}) de UrQMD. La variable \texttt{ncl} permite
+clasificar cada partícula según su historial de colisiones, clasificación
+que se usa de manera sistemática en todos los scripts posteriores:
+
+\begin{itemize}
+    \item $\texttt{ncl}=0$: \textbf{espectadoras} — nucleones que no sufrieron
+    ninguna colisión y por tanto conservan (aproximadamente) su cuadrimomento
+    original.
+    \item $\texttt{ncl}=1$: \textbf{primarias} — participaron en exactamente
+    una colisión.
+    \item $\texttt{ncl}>1$: \textbf{secundarias} — productos de colisiones o
+    reacciones múltiples (resonancias, rescattering).
+    \item $\texttt{ncl}>0$ (primarias $\cup$ secundarias): agrupadas bajo la
+    etiqueta \textbf{participantes} en los análisis de fluctuaciones.
+\end{itemize}
+
+\noindent
+Tanto la lectura de un archivo (\texttt{iter\_events}) como la de un
+directorio completo de corridas (\texttt{iter\_all}) están implementadas
+como generadores de Python: cada evento se procesa y se libera de memoria
+antes de leer el siguiente, de modo que el consumo de RAM es constante
+($\mathcal{O}(1)$) sin importar si se procesan cien o cien mil eventos. Esta
+decisión de diseño es la que permite que todos los scripts de la sección
+siguiente escalen al conjunto completo de $10^{5}$ eventos en un único
+recorrido (\textit{streaming}) de los datos.
+
+% ------------------------------------------------------------------
+\subsection{Extracción de Observables desde \texttt{.f14}}
+\label{sec:pipeline_observables}
+
+\noindent
+Sobre la base de \texttt{read\_f14.py} se construyó una batería de scripts
+de análisis, cada uno enfocado en un observable físico distinto:
+
+\begin{itemize}
+
+\item \textbf{\texttt{build\_dataset.py}} — convierte el flujo de eventos en
+un archivo HDF5 compacto, con histogramas por evento de $p_T$ (60 bins,
+0--3 GeV/$c$), $\eta$ (80 bins, $-8$ a $8$) y $\phi$ (72 bins, $-\pi$ a
+$\pi$), más el vector de parámetros de impacto $b$. La escritura se realiza
+por lotes (\textit{batches}) con compresión \texttt{gzip} y \textit{datasets}
+redimensionables, preservando el mismo consumo constante de memoria de
+\texttt{read\_f14.py}. Este archivo HDF5 es la representación de entrada
+que consume directamente la VAE de histograma completo
+(\texttt{vae\_pt.py}, Sección~\ref{sec:vae}).
+
+\item \textbf{\texttt{plot\_observables.py}} (versión final; la primera
+iteración, \texttt{p\_o.py}, procesaba una sola carpeta y una sola especie a
+la vez) — genera los espectros $\frac{1}{N_{\text{ev}}}\frac{dN}{dp_T}$,
+$\frac{1}{N_{\text{ev}}}\frac{dN}{d\eta}$ y $\frac{1}{N_{\text{ev}}}\frac{dN}{d\phi}$
+combinando varias carpetas de simulación en una sola pasada. Para cada
+observable se generan tres gráficas: \emph{Todas} (sin desglose de especie),
+\emph{Cargadas} ($\pi^{+},\pi^{-},K^{+},K^{-},p$, identificados por
+\texttt{ityp} y el signo de \texttt{chg}) y \emph{No cargadas}
+($\pi^{0},K^{0},\bar{K}^{0},n$ — el neutrón solo aparece en este último
+grupo, ya que es la única especie neutra masiva de interés), y dentro de
+cada gráfica se superponen las curvas de partículas \emph{participantes}
+y \emph{espectadoras}. El script admite además la opción
+\texttt{--by-species} para obtener una gráfica individual por cada una de
+las 11 especies. Estas son las figuras presentadas en la
+Sección~\ref{sec:pt_eta_resultados} (Figuras~\ref{fig:pt_pions}
+a~\ref{fig:pt_charged}).
+
+\item \textbf{\texttt{fluc\_observables.py}} — clasifica cada evento en una
+de 10 clases de centralidad según cortes en $b$ (siguiendo el mapeo
+Glauber $b\!\to\!$centralidad usado en el resto del trabajo, de 0--10\%
+hasta 90--100\%) y produce, por clase: la distribución del número de
+partículas por evento, un diagrama de caja tipo \textit{vela japonesa}
+(mínimo/Q1/mediana/Q3/máximo/media) de la multiplicidad, la distribución
+de $p_T$ normalizada por evento, y la distribución de $\langle p_T\rangle$
+por evento. Es el primer diagnóstico visual de que la dispersión de
+$\langle p_T\rangle$ efectivamente varía con la centralidad, antes de
+calcular los momentos formales.
+
+\item \textbf{\texttt{pt\_moments.py}} — calcula, para cada clase de
+centralidad, los momentos muestrales $\mu_1=\langle\langle p_T\rangle\rangle$
+(Ecuación~\ref{eq:grand_mean_pt}), $\mu_2=\sigma^2_{\langle p_T\rangle}$ y
+$\mu_3$ (Ecuaciones~\ref{eq:momento_n_muestral}
+y~\ref{eq:skewness_muestral}) de la distribución $P(\langle p_T\rangle)$, y
+los contrasta con la predicción cerrada de la distribución Gamma derivada
+en la Sección~\ref{sec:momentos_pt_gamma}: $\alpha=\mu_1^2/\mu_2$,
+$\beta=\mu_2/\mu_1$, $\mu_{3,\text{pred}}=\mu_2^2/\mu_1$ y
+$S_{\text{pred}}=2/\sqrt{\alpha}$. Este script es, en la práctica, la
+validación numérica de la derivación analítica del Capítulo 5: compara el
+\textit{skewness} medido contra el predicho por el modelo Gamma en función
+de la centralidad. El error de $\mu_1$ se reporta como error estándar de la
+media; los de $\mu_2$, $\mu_3$ y $S$, por \textit{bootstrap} (500
+remuestreos), al no poder asumirse normalidad para esos estimadores.
+
+\item \textbf{\texttt{pt\_correlator.py}} y \textbf{\texttt{pt\_correlator\_norm.py}}
+— calculan el correlador de dos partículas $\langle \Delta p_{T,i}\,\Delta
+p_{T,j}\rangle$ (Ecuación~\ref{eq:correlador_2p}, equivalente a
+$\sigma^2_{\text{dyn}}$ de la Ecuación~\ref{eq:sigma2_dyn}) y su versión
+normalizada $\sqrt{\langle N\rangle\,\langle \Delta p_{T,i}\,\Delta
+p_{T,j}\rangle}/\langle\langle p_T\rangle\rangle$
+(cf. Ecuación~\ref{eq:cv_correlador}), separando las partículas por
+\texttt{ncl} en primarias y secundarias en vez de por cortes de
+$|\eta|<1.0$, que se usaron en una versión previa y se retiraron
+deliberadamente por decisión metodológica. El error se estima por
+\textit{jackknife} \textit{delete-1} en lugar de \textit{bootstrap}, pues
+la razón $\sqrt{\langle N\rangle\cdot\text{corr}}/\mu_1$ amplifica el
+ruido cuando el correlador es pequeño, y el \textit{jackknife} resulta más
+estable en ese régimen.
+
+\end{itemize}
+
+\noindent
+En conjunto, estos cinco scripts comparten la misma capa de lectura
+(\texttt{read\_f14.py}), los mismos cortes de centralidad y las mismas
+convenciones de selección de partículas, de modo que los observables que
+alimentan el análisis estadístico (Capítulo 4) y los que alimentan la VAE
+(siguiente subsección) provienen de exactamente los mismos filtros
+aplicados a los mismos $10^{5}$ eventos.
+
+% ------------------------------------------------------------------
+\subsection{Nota sobre la Interpretación del Espectro de $\eta$: Espectadoras
+y Aceptancia del MPD}
+\label{sec:nota_eta_espectadoras}
+
+\noindent
+Un resultado que conviene precisar es el comportamiento de las partículas
+espectadoras en la variable $\eta$: su distribución se concentra en una
+región relativamente plana para $|\eta|\lesssim 4$, en contraste con las
+partículas participantes, que dominan a rapidez media. Es importante
+señalar que $\eta$ se calcula, como se mostró arriba, directamente del
+cuadrimomento reportado por UrQMD al nivel de generador; no depende en
+absoluto de la geometría del MPD ni del tiempo en el que una partícula
+alcanzaría físicamente algún subdetector, de modo que el origen de esta
+estructura es puramente cinemático y no instrumental. La explicación física
+es la siguiente: para $\sqrt{s_{NN}}=11$ GeV la rapidez del haz es
+$y_{\text{haz}}=\operatorname{arccosh}\!\big(\sqrt{s_{NN}}/2m_N\big)\approx
+2.45$ (Ecuación~\ref{eq:rapidity}); los nucleones espectadores, al no
+colisionar, conservan una rapidez cercana a $y_{\text{haz}}$, con un
+ensanchamiento adicional producido por el movimiento de Fermi intrínseco de
+los nucleones dentro del núcleo antes del choque. Esa combinación es la que
+produce la meseta observada hasta $|\eta|\approx 4$, en contraste con la
+región de rapidez media ($|y|<1.2$) donde se concentran las partículas
+participantes y que constituye la aceptancia central del MPD
+(Sección~\ref{cap:NICA}).
+
+\noindent
+La relevancia de esta observación para el diseño experimental es, entonces,
+de \emph{aceptancia} y no de dinámica de colisión con el detector: dado que
+la TPC del MPD cubre únicamente $|\eta|<1.5$, las partículas espectadoras
+caen sistemáticamente fuera de su aceptancia y deben medirse con un
+subdetector dedicado a ángulos muy pequeños respecto al eje del haz —el ZDC
+(\textit{Zero-Degree Calorimeter})—, que es precisamente el instrumento que
+el MPD utiliza para calibrar la centralidad y el plano de reacción a partir
+de la energía de las espectadoras. En otras palabras: la separación
+espacial entre participantes y espectadoras que se observa en estos
+histogramas de $\eta$ es la razón física por la que el MPD necesita
+subdetectores distintos (TPC/TOF centrales frente a ZDC frontal) para cada
+población, y no una consecuencia de la forma cilíndrica del detector
+actuando sobre trayectorias ya generadas.
+
+% ==================================================================
+\subsection{Implementación del Autoencoder Variacional (VAE)}
+\label{sec:vae}
+
+\noindent
+Sobre la base teórica de la Sección~\ref{sec:vae_teoria} (función objetivo
+ELBO, Ecuación~\ref{eq:elbo}) se implementaron y compararon cuatro
+representaciones de entrada distintas para el VAE, cada una encapsulada en
+su propio script. La comparación no es arbitraria: cada representación
+responde a una crítica metodológica distinta sobre qué información del
+evento debe ver la red, y las últimas versiones incorporan directamente la
+retroalimentación recibida durante el desarrollo.
+
+\begin{enumerate}
+
+\item \textbf{\texttt{vae\_pt.py} — histograma completo de $p_T$.} La
+entrada es el histograma normalizado de $p_T$ del evento (60 bins,
+0--3 GeV/$c$, el mismo \textit{binning} que produce
+\texttt{build\_dataset.py}), es decir, la VAE ve la \emph{forma completa}
+del espectro. Arquitectura: codificador $60\to256\to128\to(\mu_z,\log
+\sigma_z^2)$, decodificador $z_{\dim}\to128\to256\to60$ con salida
+\texttt{softmax} (reconstruye una distribución de probabilidad). Función de
+pérdida $\mathcal{L}=\text{MSE}(x,\hat{x})+\beta D_{\text{KL}}$ (o
+entropía cruzada binaria con la bandera \texttt{--bce}). El espacio latente
+se evalúa correlacionándolo (Pearson) con $b$, la clase de centralidad,
+$\langle p_T\rangle$ y la multiplicidad, y mediante \textit{clustering}
+no supervisado (K-means y DBSCAN, evaluados con \textit{silhouette score}).
+
+\item \textbf{\texttt{vae\_pt\_mean.py} — histograma \textit{bootstrap} de
+$\langle p_T\rangle$.} En lugar de usar el histograma crudo de $p_T$ (que
+mezcla la forma del espectro con ruido estadístico de conteo finito), este
+script construye, para cada evento $i$, un histograma \emph{derivado}: se
+remuestrean con reemplazo las $N_i$ partículas del evento $K$ veces, se
+calcula $\langle p_T\rangle$ en cada remuestreo, y el histograma normalizado
+de esas $K$ estimaciones es el vector de entrada. El ancho de ese
+histograma tiene una lectura física directa: es la incertidumbre
+estadística de $\langle p_T\rangle_i$ dado un $N_i$ finito
+($\sim\sigma_{p_T}/\sqrt{N_i}$), de modo que la VAE ve simultáneamente la
+posición \emph{y} la precisión de la estimación. La multiplicidad mínima
+$N_{\min}$ ya no se fija a mano: se estima mediante un estudio de
+\textit{bootstrap} independiente sobre el error estándar de
+$\langle p_T\rangle$ en función de $N$ (función \texttt{estimate\_n\_min}).
+Todo el análisis —carga, cálculo de $N_{\min}$, entrenamiento y
+\textit{clustering}— se realiza por separado para cada una de las 10 clases
+de centralidad, entrenando un modelo independiente por clase.
+
+\item \textbf{\texttt{vae\_moments.py} (y su variante \texttt{vae\_3m.py})
+— tres momentos intra-evento.} Reduce cada evento a un vector de solo tres
+escalares, $x=(\mu_1,\mu_2,\mu_3)$, calculados sobre las partículas
+\emph{dentro} de ese evento:
+$\mu_1=\langle p_T\rangle_i$, $\mu_2=\frac{1}{N}\sum(p_{T,j}-\mu_1)^2$,
+$\mu_3=\frac{1}{N}\sum(p_{T,j}-\mu_1)^3$. Conviene subrayar, para que quede
+explícito en la tesis, que estos $\mu_2,\mu_3$ describen la forma del
+espectro \emph{dentro} de un solo evento y no deben confundirse con
+$\sigma^2_{\langle p_T\rangle}$ ni con el \textit{skewness} $S$ del
+\emph{ensemble} $P(\langle p_T\rangle)$ definidos en las
+Ecuaciones~\ref{eq:momento_n_muestral} y~\ref{eq:skewness_muestral}: son
+observables físicos válidos por derecho propio, pero conceptualmente
+distintos. Al tratarse de una entrada de solo 3 dimensiones, la arquitectura
+se reduce drásticamente ($3\to64\to32\to(\mu_z,\log\sigma_z^2)$).
+
+\item \textbf{\texttt{vae\_moments\_V3.py} — momentos como desviaciones
+respecto a la centralidad, con correcciones metodológicas.} Es una
+revisión de \texttt{vae\_moments.py} que incorpora, en respuesta a
+retroalimentación recibida durante el desarrollo:
+\begin{itemize}
+    \item $d_z\le 2$: no tiene sentido comprimir una entrada de dimensión 3
+    a un espacio latente de dimensión mayor o igual.
+    \item Corte $N\ge N_{\min}=10$ para garantizar validez estadística de
+    $\mu_2$ y $\mu_3$, con $N_{\min}$ eventualmente determinado también por
+    \textit{bootstrap} (misma idea que en \texttt{vae\_pt\_mean.py}) en
+    vez de fijarse arbitrariamente.
+    \item Entrada redefinida como \emph{desviaciones} respecto al promedio
+    de la clase de centralidad, $\delta\mu_k=\mu_k-\langle\mu_k\rangle_{\text{clase}}$,
+    de forma que la red aprenda las fluctuaciones intrínsecas del evento y
+    no la dependencia geométrica trivial con la centralidad.
+    \item Arquitectura reducida ($3\to16\to8\to d_z$) para evitar
+    sobreparametrización, y $\beta\ge0.5$ para prevenir el colapso del
+    posterior.
+    \item Un \texttt{StandardScaler} \emph{independiente por clase de
+    centralidad}, en vez de uno global: dado que la varianza de las
+    fluctuaciones $\delta\mu_k$ escala con la multiplicidad (y por tanto con
+    la centralidad), un escalador único distorsiona la magnitud relativa
+    de las fluctuaciones centrales frente a las periféricas
+    (heterocedasticidad, diagnosticada explícitamente antes de aplicar la
+    corrección).
+\end{itemize}
+
+\end{enumerate}
+
+\noindent
+En los cuatro casos, la representación latente $\mathbf{z}$ se somete al
+mismo protocolo de validación: correlación de Pearson/Spearman con $b$, la
+clase de centralidad y los observables de $p_T$; agrupamiento no
+supervisado (K-means/DBSCAN) evaluado con \textit{silhouette score}; y
+comparación entre entrada original y reconstrucción por clase de
+centralidad. Esta progresión —de un histograma de 60 bins, a una
+representación \textit{bootstrap} de la incertidumbre, a un resumen de solo
+tres momentos, y finalmente a las desviaciones de esos momentos respecto a
+su propia clase de centralidad— documenta explícitamente cómo cada
+iteración responde a una limitación metodológica identificada en la
+anterior, y constituye la base sobre la que se construirá la comparación
+cuantitativa de la Etapa IV (Sección~\ref{cap:avances}).
+
+\noindent
+\textbf{Nota para la versión final del texto/repositorio:} el nombre y el
+docstring interno de los scripts de la VAE de momentos no son
+completamente consistentes entre sí —por ejemplo, \texttt{vae\_3m.py}
+conserva en su docstring el nombre \texttt{vae\_moments.py}, y el
+\texttt{vae\_moments.py} actual se autodescribe como una ``v4'' aun cuando
+el archivo \texttt{vae\_moments\_V3.py} implementa las correcciones
+etiquetadas como versión 3. Antes de referenciar estos archivos como
+apéndice o material suplementario de la tesis conviene renombrarlos de
+forma consecutiva (p. ej. \texttt{vae\_moments\_v1.py} \ldots
+\texttt{v4.py}) y actualizar sus docstrings para que coincidan, de manera
+que un lector del código (por ejemplo, el comité) pueda seguir la
+cronología de las correcciones sin ambigüedad.
